@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""
+cfreg — a thin, scriptable CLI wrapper around the Cloudflare Registrar REST API.
+
+Responsibility
+--------------
+This single file IS the whole tool. It maps registrar API endpoints to
+subcommands (search / check / list / get / register / update / status) and
+prints raw JSON to stdout so output composes with `jq` and shell pipelines.
+There is intentionally no interactive prompting, no config wizard, and no
+hidden state: every input is a flag or positional argument, and credentials
+come from flags or environment variables.
+
+Where it fits
+-------------
+Standalone. It talks directly to https://api.cloudflare.com/client/v4 — it does
+NOT shell out to the `cf` CLI, because the `cf` CLI (v0.0.5) does not expose the
+domain-search / domain-check / registrations endpoints, and its stored OAuth
+token is not accepted as a plain Bearer for raw API calls. So this tool requires
+a dedicated Cloudflare API token scoped to Registrar.
+
+Auth & account resolution (first non-empty wins)
+------------------------------------------------
+  token   : --token  | $CLOUDFLARE_API_TOKEN | $CF_API_TOKEN
+  account : --account | $CLOUDFLARE_ACCOUNT_ID | $CF_ACCOUNT_ID
+
+Safety
+------
+`register` is the ONLY billable, non-refundable call. It refuses to run without
+the explicit `--yes` flag. This keeps the tool non-interactive (scriptable) while
+making an accidental purchase impossible from a stray re-run. `auto_renew`
+defaults to false everywhere and is only ever set when explicitly requested.
+
+Exit codes
+----------
+  0  success (API returned success:true)
+  1  API returned success:false  (errors printed to stderr as JSON)
+  2  usage / local error (missing token, missing --yes, bad args)
+  3  network/transport error
+
+Endpoints wrapped (see Cloudflare API docs for field semantics):
+  GET    /accounts/{acct}/registrar/domain-search
+  POST   /accounts/{acct}/registrar/domain-check
+  GET    /accounts/{acct}/registrar/registrations
+  GET    /accounts/{acct}/registrar/registrations/{domain}
+  POST   /accounts/{acct}/registrar/registrations
+  PATCH  /accounts/{acct}/registrar/registrations/{domain}
+  GET    /accounts/{acct}/registrar/registrations/{domain}/registration-status
+  GET    /accounts/{acct}/registrar/registrations/{domain}/update-status
+  GET    /accounts/{acct}/registrar/domains            (legacy: transfer-oriented list)
+"""
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+API_BASE = "https://api.cloudflare.com/client/v4"
+
+
+# --- credential / arg resolution -------------------------------------------
+
+def _first_env(*names):
+    for n in names:
+        v = os.environ.get(n)
+        if v:
+            return v
+    return None
+
+
+def resolve_token(args):
+    tok = args.token or _first_env("CLOUDFLARE_API_TOKEN", "CF_API_TOKEN")
+    if not tok:
+        _die_usage("no API token: pass --token or set CLOUDFLARE_API_TOKEN")
+    return tok
+
+
+def resolve_account(args):
+    acct = args.account or _first_env("CLOUDFLARE_ACCOUNT_ID", "CF_ACCOUNT_ID")
+    if not acct:
+        _die_usage("no account id: pass --account or set CLOUDFLARE_ACCOUNT_ID")
+    return acct
+
+
+# --- HTTP -------------------------------------------------------------------
+
+def api_request(method, path, token, query=None, body=None):
+    """Perform one API call. Returns the parsed JSON dict regardless of HTTP
+    status (Cloudflare wraps errors in a 200-style envelope but also uses real
+    HTTP error codes; we surface the JSON body either way)."""
+    url = API_BASE + path
+    if query:
+        url += "?" + urllib.parse.urlencode(query)
+
+    data = None
+    headers = {"Authorization": "Bearer " + token, "Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode()
+        try:
+            return json.loads(raw)
+        except ValueError:
+            _die(3, {"transport_error": "HTTP %d" % e.code, "body": raw})
+    except urllib.error.URLError as e:
+        _die(3, {"transport_error": str(e.reason)})
+
+
+# --- output / exit helpers --------------------------------------------------
+
+def emit(obj, compact=False):
+    if compact:
+        sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    else:
+        sys.stdout.write(json.dumps(obj, indent=2) + "\n")
+
+
+def finish(envelope, compact):
+    """Print the API envelope and exit based on its `success` flag."""
+    emit(envelope, compact)
+    sys.exit(0 if envelope.get("success") else 1)
+
+
+def _die(code, payload):
+    sys.stderr.write(json.dumps(payload) + "\n")
+    sys.exit(code)
+
+
+def _die_usage(msg):
+    _die(2, {"error": msg})
+
+
+# --- subcommand handlers ----------------------------------------------------
+
+def cmd_search(args):
+    token, acct = resolve_token(args), resolve_account(args)
+    query = {"q": args.query}
+    if args.limit:
+        query["limit"] = args.limit
+    if args.ext:
+        # API takes repeated `extensions` params; urlencode handles the list.
+        query["extensions"] = [e.strip() for e in args.ext.split(",") if e.strip()]
+    env = api_request("GET", "/accounts/%s/registrar/domain-search" % acct,
+                      token, query=query)
+    finish(env, args.compact)
+
+
+def cmd_check(args):
+    token, acct = resolve_token(args), resolve_account(args)
+    if not args.domains:
+        _die_usage("check requires at least one domain")
+    if len(args.domains) > 20:
+        _die_usage("check accepts at most 20 domains per request")
+    env = api_request("POST", "/accounts/%s/registrar/domain-check" % acct,
+                      token, body={"domains": args.domains})
+    finish(env, args.compact)
+
+
+def cmd_list(args):
+    token, acct = resolve_token(args), resolve_account(args)
+    query = {}
+    if args.cursor:
+        query["cursor"] = args.cursor
+    if args.per_page:
+        query["per_page"] = args.per_page
+    if args.sort_by:
+        query["sort_by"] = args.sort_by
+    if args.direction:
+        query["direction"] = args.direction
+    env = api_request("GET", "/accounts/%s/registrar/registrations" % acct,
+                      token, query=query or None)
+    finish(env, args.compact)
+
+
+def cmd_domains(args):
+    # Legacy transfer-oriented endpoint, kept because the `cf` CLI exposes it
+    # and existing scripts may expect the same data shape.
+    token, acct = resolve_token(args), resolve_account(args)
+    env = api_request("GET", "/accounts/%s/registrar/domains" % acct, token)
+    finish(env, args.compact)
+
+
+def cmd_get(args):
+    token, acct = resolve_token(args), resolve_account(args)
+    env = api_request("GET",
+                      "/accounts/%s/registrar/registrations/%s" % (acct, args.domain),
+                      token)
+    finish(env, args.compact)
+
+
+def cmd_register(args):
+    token, acct = resolve_token(args), resolve_account(args)
+    # Billable, non-refundable. Require explicit opt-in; stays non-interactive.
+    if not args.yes:
+        _die_usage("register is billable and non-refundable; pass --yes to confirm")
+    body = {"domain_name": args.domain}
+    if args.years:
+        body["years"] = args.years
+    if args.auto_renew:
+        body["auto_renew"] = True
+    if args.privacy:
+        body["privacy_mode"] = args.privacy
+    headers_async = {"Prefer": "respond-async"} if args.async_ else None
+    # Prefer header is passed via a small inline extension of api_request:
+    env = _register_request(acct, token, body, headers_async)
+    finish(env, args.compact)
+
+
+def _register_request(acct, token, body, extra_headers):
+    url = "%s/accounts/%s/registrar/registrations" % (API_BASE, acct)
+    headers = {"Authorization": "Bearer " + token,
+               "Content-Type": "application/json",
+               "Accept": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                 method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read().decode() or "{}")
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode()
+        try:
+            return json.loads(raw)
+        except ValueError:
+            _die(3, {"transport_error": "HTTP %d" % e.code, "body": raw})
+    except urllib.error.URLError as e:
+        _die(3, {"transport_error": str(e.reason)})
+
+
+def cmd_update(args):
+    token, acct = resolve_token(args), resolve_account(args)
+    body = {}
+    if args.auto_renew is not None:
+        body["auto_renew"] = args.auto_renew
+    if args.locked is not None:
+        body["locked"] = args.locked
+    if args.privacy is not None:
+        body["privacy"] = args.privacy
+    if not body:
+        _die_usage("update needs at least one of --auto-renew/--no-auto-renew, "
+                   "--lock/--no-lock, --privacy/--no-privacy")
+    # The registrations PATCH endpoint currently supports auto_renew only; the
+    # older domains PUT endpoint supports locked/privacy too. Route accordingly.
+    if set(body) <= {"auto_renew"}:
+        env = api_request("PATCH",
+                          "/accounts/%s/registrar/registrations/%s" % (acct, args.domain),
+                          token, body=body)
+    else:
+        env = api_request("PUT",
+                          "/accounts/%s/registrar/domains/%s" % (acct, args.domain),
+                          token, body=body)
+    finish(env, args.compact)
+
+
+def cmd_status(args):
+    token, acct = resolve_token(args), resolve_account(args)
+    suffix = "update-status" if args.type == "update" else "registration-status"
+    env = api_request("GET",
+                      "/accounts/%s/registrar/registrations/%s/%s" % (acct, args.domain, suffix),
+                      token)
+    finish(env, args.compact)
+
+
+# --- arg parsing ------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="cfreg",
+        description="Scriptable Cloudflare Registrar CLI (JSON output, no prompts).")
+
+    # Global flags applied to every subcommand via a shared parent parser.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--token", help="API token (or $CLOUDFLARE_API_TOKEN)")
+    common.add_argument("-a", "--account", help="account id (or $CLOUDFLARE_ACCOUNT_ID)")
+    common.add_argument("-c", "--compact", action="store_true",
+                        help="single-line JSON output")
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("search", parents=[common],
+                       help="suggest available domains (non-authoritative)")
+    s.add_argument("query", help="keyword, phrase, or domain name")
+    s.add_argument("--ext", help="comma-separated extensions, e.g. com,dev,app")
+    s.add_argument("--limit", type=int, help="max suggestions (default 20)")
+    s.set_defaults(func=cmd_search)
+
+    s = sub.add_parser("check", parents=[common],
+                       help="authoritative availability check (<=20 domains)")
+    s.add_argument("domains", nargs="+", help="FQDNs incl. extension")
+    s.set_defaults(func=cmd_check)
+
+    s = sub.add_parser("list", parents=[common],
+                       help="list registrations owned by the account")
+    s.add_argument("--cursor", help="pagination cursor from a prior response")
+    s.add_argument("--per-page", type=int, dest="per_page")
+    s.add_argument("--sort-by", dest="sort_by",
+                   choices=["registry_created_at", "registry_expires_at", "name"])
+    s.add_argument("--direction", choices=["asc", "desc"])
+    s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("domains", parents=[common],
+                       help="legacy domains list (transfer-oriented)")
+    s.set_defaults(func=cmd_domains)
+
+    s = sub.add_parser("get", parents=[common],
+                       help="get one registration's current state")
+    s.add_argument("domain")
+    s.set_defaults(func=cmd_get)
+
+    s = sub.add_parser("register", parents=[common],
+                       help="register a domain (BILLABLE; requires --yes)")
+    s.add_argument("domain")
+    s.add_argument("--years", type=int, help="registration term (default: registry min)")
+    s.add_argument("--auto-renew", action="store_true", dest="auto_renew",
+                   help="opt in to auto-renewal (authorizes future charges)")
+    s.add_argument("--privacy", choices=["redaction", "off"],
+                   help="WHOIS privacy mode (default redaction)")
+    s.add_argument("--async", action="store_true", dest="async_",
+                   help="return immediately with 202 and poll via `status`")
+    s.add_argument("--yes", action="store_true",
+                   help="required: confirm this billable, non-refundable purchase")
+    s.set_defaults(func=cmd_register)
+
+    s = sub.add_parser("update", parents=[common],
+                       help="update auto-renew / lock / privacy on a domain")
+    s.add_argument("domain")
+    # Tri-state booleans: None = leave unchanged.
+    s.add_argument("--auto-renew", dest="auto_renew", action="store_const", const=True)
+    s.add_argument("--no-auto-renew", dest="auto_renew", action="store_const", const=False)
+    s.add_argument("--lock", dest="locked", action="store_const", const=True)
+    s.add_argument("--no-lock", dest="locked", action="store_const", const=False)
+    s.add_argument("--privacy", dest="privacy", action="store_const", const=True)
+    s.add_argument("--no-privacy", dest="privacy", action="store_const", const=False)
+    s.set_defaults(func=cmd_update, auto_renew=None, locked=None, privacy=None)
+
+    s = sub.add_parser("status", parents=[common],
+                       help="poll a registration or update workflow")
+    s.add_argument("domain")
+    s.add_argument("--type", choices=["registration", "update"],
+                   default="registration")
+    s.set_defaults(func=cmd_status)
+
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
