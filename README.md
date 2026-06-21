@@ -5,6 +5,10 @@ Single file, Python 3 stdlib only (no dependencies), JSON output, **no
 interactive prompts** — every input is a flag or argument so it drops straight
 into scripts and pipes into `jq`.
 
+![cfreg demo](demo.gif)
+
+<sub>Demo recorded with [vhs](https://github.com/charmbracelet/vhs); regenerate with `vhs demo.tape`.</sub>
+
 > Why not the official `cf` CLI? As of `cf` v0.0.5 the registrar surface is only
 > `cf registrar domains {get,list,update}` — no search, check, or register — and
 > its OAuth token isn't accepted for raw API calls. So this tool talks to the API
