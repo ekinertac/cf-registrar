@@ -285,7 +285,9 @@ def build_parser():
     common.add_argument("-c", "--compact", action="store_true",
                         help="single-line JSON output")
 
-    sub = p.add_subparsers(dest="cmd", required=True)
+    # Not required: running `cfreg` bare prints full help (see main) instead of
+    # argparse's terse "a command is required" error.
+    sub = p.add_subparsers(dest="cmd")
 
     s = sub.add_parser("search", parents=[common],
                        help="suggest available domains (non-authoritative)")
@@ -354,7 +356,11 @@ def build_parser():
 
 
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        sys.exit(0)
     args.func(args)
 
 
